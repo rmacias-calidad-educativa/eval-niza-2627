@@ -136,11 +136,18 @@ def load_data(source):
     dedup_cols = [c for c in ["AttemptId", "QuizName", "Pregunta", "RespuestaEst", "IsCorrect", "Descriptor"] if c in df.columns]
     df = df.drop_duplicates(dedup_cols, keep="first").copy()
 
-    df["Grado_num"] = df["QuizName"].map(infer_grade_num_from_quiz)
-    missing_grade = df["Grado_num"].isna()
-    df.loc[missing_grade, "Grado_num"] = df.loc[missing_grade, "Grado"].map(infer_grade_num_from_grade)
-    df["Grado_num"] = pd.to_numeric(df["Grado_num"], errors="coerce")
-    df["Grado_analisis"] = df["Grado_num"].map(lambda x: GRADE_LABEL.get(int(x)) if pd.notna(x) else None)
+    # Construir el grado sin asignaciones parciales sobre una columna numérica.
+    # Esto evita LossySetitemError en versiones recientes de pandas.
+    grade_from_quiz = df["QuizName"].map(infer_grade_num_from_quiz)
+    grade_from_column = df["Grado"].map(infer_grade_num_from_grade)
+    df["Grado_num"] = (
+        pd.to_numeric(grade_from_quiz, errors="coerce")
+        .combine_first(pd.to_numeric(grade_from_column, errors="coerce"))
+        .astype("Int64")
+    )
+    df["Grado_analisis"] = df["Grado_num"].map(
+        lambda x: GRADE_LABEL.get(int(x)) if pd.notna(x) else None
+    )
 
     df["Prueba_grupo"] = df["QuizName"].map(normalize_test)
     df["Subprueba"] = df["QuizName"].map(normalize_subtest)
