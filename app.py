@@ -52,6 +52,22 @@ def numfmt(x, digits=1):
     return "–" if pd.isna(x) else f"{x:.{digits}f}"
 
 
+def performance_level(score):
+    """Clasifica un puntaje 0-100 según los cortes definidos."""
+    if pd.isna(score):
+        return "Sin resultado"
+    if score <= 25:
+        return "Progreso limitado"
+    if score <= 50:
+        return "Emergente"
+    if score <= 75:
+        return "Aceleración"
+    return "Avanzado"
+
+
+PERFORMANCE_ORDER = ["Progreso limitado", "Emergente", "Aceleración", "Avanzado"]
+
+
 def clean_text(x):
     if pd.isna(x):
         return ""
@@ -153,6 +169,22 @@ def load_data(source):
     df["Subprueba"] = df["QuizName"].map(normalize_subtest)
     df["Curso"] = df["AULA"].replace("", np.nan)
     df = df[df["Prueba_grupo"].isin(TEST_ORDER)].copy()
+
+    # Inferir el máximo de ítems esperado de forma empírica para cada grado × prueba.
+    # Se cuenta el número de registros de respuesta por intento y se toma el máximo observado.
+    attempt_counts = (
+        df.groupby(["AttemptId", "Grado_num", "Prueba_grupo"], dropna=False)
+        .size()
+        .rename("Items_registrados")
+        .reset_index()
+    )
+    expected = (
+        attempt_counts.groupby(["Grado_num", "Prueba_grupo"], dropna=False)["Items_registrados"]
+        .max()
+        .rename("Items_esperados")
+        .reset_index()
+    )
+    df = df.merge(expected, on=["Grado_num", "Prueba_grupo"], how="left")
     return df
 
 
@@ -160,25 +192,38 @@ def load_data(source):
 def attempt_table(df):
     cols = [c for c in ["AttemptId", "Prueba_grupo", "Subprueba", "QuizName", "Grado_num", "Grado_analisis", "Curso"] if c in df.columns]
     if df.empty:
-        return pd.DataFrame(columns=cols + ["Puntaje", "Respuestas", "Estudiante", "Sede"])
+        return pd.DataFrame(columns=cols + ["Puntaje", "Respuestas", "Correctas", "Items_esperados", "Faltantes", "Cobertura", "Nivel", "Estudiante", "Sede"])
 
     agg = (
         df.groupby(cols, dropna=False)
         .agg(
-            Puntaje=("IsCorrect", "mean"),
             Respuestas=("IsCorrect", "count"),
+            Correctas=("IsCorrect", "sum"),
+            Items_esperados=("Items_esperados", "max"),
             Estudiante=("IdentiEstudiante", "first"),
             Sede=("Sede", "first"),
         )
         .reset_index()
     )
-    agg["Puntaje"] = agg["Puntaje"] * 100
+    agg["Items_esperados"] = pd.to_numeric(agg["Items_esperados"], errors="coerce")
+    agg["Faltantes"] = (agg["Items_esperados"] - agg["Respuestas"]).clip(lower=0)
+    agg["Cobertura"] = np.where(
+        agg["Items_esperados"] > 0,
+        agg["Respuestas"] / agg["Items_esperados"] * 100,
+        np.nan,
+    )
+    # El denominador es el total esperado, no solo lo contestado.
+    agg["Puntaje"] = np.where(
+        agg["Items_esperados"] > 0,
+        agg["Correctas"] / agg["Items_esperados"] * 100,
+        np.nan,
+    )
+    agg["Nivel"] = agg["Puntaje"].map(performance_level)
     return agg
-
 
 def stats_table(att_df, group_cols):
     if att_df.empty:
-        return pd.DataFrame(columns=group_cols + ["Promedio", "DE", "Estudiantes", "Intentos"])
+        return pd.DataFrame(columns=group_cols + ["Promedio", "DE", "Estudiantes", "Intentos", "Items_esperados", "Respondidas_prom", "Faltantes_prom", "Cobertura_prom"])
     out = (
         att_df.groupby(group_cols, dropna=False)
         .agg(
@@ -186,12 +231,34 @@ def stats_table(att_df, group_cols):
             DE=("Puntaje", "std"),
             Estudiantes=("Estudiante", pd.Series.nunique),
             Intentos=("AttemptId", pd.Series.nunique),
+            Items_esperados=("Items_esperados", "max"),
+            Respondidas_prom=("Respuestas", "mean"),
+            Faltantes_prom=("Faltantes", "mean"),
+            Cobertura_prom=("Cobertura", "mean"),
         )
         .reset_index()
     )
     out["DE"] = out["DE"].fillna(0)
     return out
 
+
+def performance_distribution(att_df, group_cols):
+    """Distribución porcentual de niveles de desempeño por grupos."""
+    if att_df.empty:
+        return pd.DataFrame(columns=group_cols + ["Nivel", "Estudiantes", "Porcentaje"])
+    # Un intento representa la unidad de resultado.
+    dist = (
+        att_df.groupby(group_cols + ["Nivel"], dropna=False)
+        .size()
+        .rename("Estudiantes")
+        .reset_index()
+    )
+    if group_cols:
+        totals = dist.groupby(group_cols, dropna=False)["Estudiantes"].transform("sum")
+    else:
+        totals = pd.Series(dist["Estudiantes"].sum(), index=dist.index)
+    dist["Porcentaje"] = np.where(totals > 0, dist["Estudiantes"] / totals * 100, 0)
+    return dist
 
 def build_grade_summary_matrix(summary_df):
     rows = []
@@ -267,7 +334,7 @@ df = load_data(source)
 att = attempt_table(df)
 
 st.title("📊 Visualizador de resultados académicos")
-st.caption("Resumen por grado y prueba, con un detalle centrado únicamente en pruebas y dimensiones.")
+st.caption("Resultados en escala 0–100, incorporando cobertura de respuesta, datos faltantes y niveles de desempeño.")
 
 st.sidebar.header("Filtros")
 sedes = sorted([x for x in df["Sede"].dropna().astype(str).unique() if x]) if "Sede" in df.columns else []
@@ -279,20 +346,38 @@ main_tab, detail_tab = st.tabs(["🌐 Vista general", "🎯 Pruebas y dimensione
 
 with main_tab:
     st.subheader("Vista general por grado")
-    st.write("Para cada grado se muestran las **5 pruebas agrupadas**: Matemáticas, Lectura, Ciencias naturales, Ciencias sociales e Inglés. Cuando una prueba no corresponde al grado, aparece como **No aplica**.")
+    st.write("Para cada grado se muestran las **5 pruebas agrupadas**: Matemáticas, Lectura, Ciencias naturales, Ciencias sociales e Inglés. El puntaje se calcula sobre el **máximo de ítems observado para cada grado × prueba**, de modo que los ítems faltantes no inflen artificialmente el resultado. Cuando una prueba no corresponde al grado, aparece como **No aplica**.")
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Estudiantes", f"{base['IdentiEstudiante'].nunique():,}".replace(",", "."))
     c2.metric("Intentos", f"{att_base['AttemptId'].nunique():,}".replace(",", "."))
     c3.metric("Grados con datos", f"{att_base['Grado_analisis'].nunique():,}".replace(",", "."))
     c4.metric("Promedio general", pct(att_base["Puntaje"].mean()))
+    c5.metric("Ítems faltantes promedio", numfmt(att_base["Faltantes"].mean()))
 
     grade_test_summary = stats_table(att_base, ["Grado_num", "Grado_analisis", "Prueba_grupo"])
     matrix_df = build_grade_summary_matrix(grade_test_summary)
 
     st.markdown("### Resumen general: grado × prueba")
     st.dataframe(matrix_df, use_container_width=True, hide_index=True)
-    st.markdown("<div class='small-note'>Cada celda muestra: promedio, desviación estándar (DE) y cantidad de estudiantes únicos.</div>", unsafe_allow_html=True)
+    st.markdown("<div class='small-note'>Cada celda muestra: promedio, desviación estándar (DE) y cantidad de estudiantes únicos. El puntaje usa como denominador el máximo de ítems observado en cada grado × prueba.</div>", unsafe_allow_html=True)
+
+    st.markdown("### Cobertura de respuesta y datos faltantes")
+    coverage_general = grade_test_summary.copy()
+    coverage_general["Grado"] = coverage_general["Grado_num"].map(GRADE_LABEL)
+    coverage_display = coverage_general[["Grado", "Prueba_grupo", "Items_esperados", "Respondidas_prom", "Faltantes_prom", "Cobertura_prom"]].rename(
+        columns={
+            "Prueba_grupo": "Prueba",
+            "Items_esperados": "Ítems esperados",
+            "Respondidas_prom": "Respondidas promedio",
+            "Faltantes_prom": "Faltantes promedio",
+            "Cobertura_prom": "Cobertura promedio",
+        }
+    )
+    coverage_display["Respondidas promedio"] = coverage_display["Respondidas promedio"].round(1)
+    coverage_display["Faltantes promedio"] = coverage_display["Faltantes promedio"].round(1)
+    coverage_display["Cobertura promedio"] = coverage_display["Cobertura promedio"].round(1).astype(str) + "%"
+    st.dataframe(coverage_display, use_container_width=True, hide_index=True)
 
     st.markdown("### Resultado promedio por grado y prueba")
     chart_df = grade_test_summary.copy()
@@ -323,9 +408,9 @@ with main_tab:
         row = {"Prueba": test_name}
         tmp = grade_summary[grade_summary["Prueba_grupo"] == test_name]
         if not is_applicable(selected_grade_num, test_name):
-            row.update({"Aplicación": "No aplica", "Promedio": "–", "DE": "–", "Estudiantes": "–", "Intentos": "–"})
+            row.update({"Aplicación": "No aplica", "Promedio": "–", "DE": "–", "Estudiantes": "–", "Intentos": "–", "Ítems esperados": "–", "Faltantes prom.": "–", "Cobertura": "–"})
         elif tmp.empty:
-            row.update({"Aplicación": "Sin datos", "Promedio": "–", "DE": "–", "Estudiantes": "–", "Intentos": "–"})
+            row.update({"Aplicación": "Sin datos", "Promedio": "–", "DE": "–", "Estudiantes": "–", "Intentos": "–", "Ítems esperados": "–", "Faltantes prom.": "–", "Cobertura": "–"})
         else:
             r = tmp.iloc[0]
             row.update({
@@ -334,6 +419,9 @@ with main_tab:
                 "DE": f"{r['DE']:.1f}",
                 "Estudiantes": int(r["Estudiantes"]),
                 "Intentos": int(r["Intentos"]),
+                "Ítems esperados": int(r["Items_esperados"]),
+                "Faltantes prom.": f"{r['Faltantes_prom']:.1f}",
+                "Cobertura": f"{r['Cobertura_prom']:.1f}%",
             })
         grade_rows.append(row)
     st.dataframe(pd.DataFrame(grade_rows), use_container_width=True, hide_index=True)
@@ -368,12 +456,30 @@ with main_tab:
         display_course = course_summary.rename(columns={"Prueba_grupo": "Prueba"}).copy()
         display_course["Promedio"] = display_course["Promedio"].round(1).astype(str) + "%"
         display_course["DE"] = display_course["DE"].round(1)
-        st.dataframe(display_course[["Curso", "Prueba", "Promedio", "DE", "Estudiantes", "Intentos"]], use_container_width=True, hide_index=True)
+        display_course["Ítems esperados"] = display_course["Items_esperados"].astype(int)
+        display_course["Faltantes prom."] = display_course["Faltantes_prom"].round(1)
+        display_course["Cobertura"] = display_course["Cobertura_prom"].round(1).astype(str) + "%"
+        st.dataframe(display_course[["Curso", "Prueba", "Promedio", "DE", "Estudiantes", "Ítems esperados", "Faltantes prom.", "Cobertura"]], use_container_width=True, hide_index=True)
+
+        st.markdown("#### Niveles de desempeño del grado seleccionado")
+        perf_grade = performance_distribution(grade_att, ["Prueba_grupo"])
+        if not perf_grade.empty:
+            perf_grade["Nivel"] = pd.Categorical(perf_grade["Nivel"], categories=PERFORMANCE_ORDER, ordered=True)
+            fig_perf = px.bar(
+                perf_grade.sort_values(["Prueba_grupo", "Nivel"]),
+                x="Prueba_grupo", y="Porcentaje", color="Nivel", barmode="stack",
+                labels={"Prueba_grupo": "Prueba", "Porcentaje": "% de intentos"},
+                category_orders={"Prueba_grupo": TEST_ORDER, "Nivel": PERFORMANCE_ORDER},
+            )
+            fig_perf.update_yaxes(range=[0, 100])
+            fig_perf.update_layout(margin=dict(t=20, b=20))
+            st.plotly_chart(fig_perf, use_container_width=True)
 
     st.markdown("### Tabla consolidada final: grado × curso × prueba")
     st.write(
         "Esta tabla resume todos los cursos en una sola vista. Cada celda contiene "
-        "**promedio, DE y número de estudiantes**; cuando una prueba no corresponde al grado, se muestra **No aplica**."
+        "**promedio, DE y número de estudiantes**; el promedio ya incorpora los ítems faltantes en el denominador. "
+        "Cuando una prueba no corresponde al grado, se muestra **No aplica**."
     )
     final_course_matrix = build_grade_course_matrix(att_base)
     if final_course_matrix.empty:
@@ -409,6 +515,9 @@ with detail_tab:
                 "Estudiantes": np.nan,
                 "Intentos": np.nan,
                 "Estado": "Sin datos",
+                "Items_esperados": np.nan,
+                "Faltantes_prom": np.nan,
+                "Cobertura_prom": np.nan,
             })
         else:
             for _, r in tmp.iterrows():
@@ -420,6 +529,9 @@ with detail_tab:
                     "Estudiantes": int(r["Estudiantes"]),
                     "Intentos": int(r["Intentos"]),
                     "Estado": "Aplicada",
+                    "Items_esperados": r["Items_esperados"],
+                    "Faltantes_prom": r["Faltantes_prom"],
+                    "Cobertura_prom": r["Cobertura_prom"],
                 })
     test_grade_df = pd.DataFrame(rows)
 
@@ -445,7 +557,10 @@ with detail_tab:
     display_test_grade = test_grade_df.copy()
     display_test_grade["Promedio"] = display_test_grade["Promedio"].map(lambda x: "–" if pd.isna(x) else f"{x:.1f}%")
     display_test_grade["DE"] = display_test_grade["DE"].map(lambda x: "–" if pd.isna(x) else f"{x:.1f}")
-    st.dataframe(display_test_grade[["Grado", "Subprueba", "Estado", "Promedio", "DE", "Estudiantes", "Intentos"]], use_container_width=True, hide_index=True)
+    display_test_grade["Ítems esperados"] = display_test_grade["Items_esperados"].map(lambda x: "–" if pd.isna(x) else int(x))
+    display_test_grade["Faltantes prom."] = display_test_grade["Faltantes_prom"].map(lambda x: "–" if pd.isna(x) else round(x, 1))
+    display_test_grade["Cobertura"] = display_test_grade["Cobertura_prom"].map(lambda x: "–" if pd.isna(x) else f"{x:.1f}%")
+    st.dataframe(display_test_grade[["Grado", "Subprueba", "Estado", "Promedio", "DE", "Estudiantes", "Ítems esperados", "Faltantes prom.", "Cobertura"]], use_container_width=True, hide_index=True)
 
     selected_grade_for_test = st.selectbox("Grado para ver dimensiones", [GRADE_LABEL[g] for g in applicable_grades], index=0)
     selected_grade_num_for_test = int(selected_grade_for_test.replace("°", ""))
@@ -459,13 +574,32 @@ with detail_tab:
         att_test_grade = att_test_grade[att_test_grade["Curso"].isin(selected_courses_test)].copy()
         test_df = test_df[test_df["Curso"].isin(selected_courses_test)].copy()
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Grado", selected_grade_for_test)
     c2.metric("Estudiantes", f"{att_test_grade['Estudiante'].nunique():,}".replace(",", "."))
-    c3.metric("Intentos", f"{att_test_grade['AttemptId'].nunique():,}".replace(",", "."))
-    c4.metric("Promedio", pct(att_test_grade["Puntaje"].mean()))
+    c3.metric("Promedio", pct(att_test_grade["Puntaje"].mean()))
+    c4.metric("Ítems esperados", numfmt(att_test_grade["Items_esperados"].max(), 0))
+    c5.metric("Faltantes promedio", numfmt(att_test_grade["Faltantes"].mean()))
+    c6.metric("Cobertura", pct(att_test_grade["Cobertura"].mean()))
+
+    st.markdown("### Niveles de desempeño")
+    perf_test = performance_distribution(att_test_grade, [])
+    if not perf_test.empty:
+        perf_test["Nivel"] = pd.Categorical(perf_test["Nivel"], categories=PERFORMANCE_ORDER, ordered=True)
+        perf_test = perf_test.sort_values("Nivel")
+        fig_levels = px.bar(
+            perf_test, x="Nivel", y="Porcentaje", text="Porcentaje",
+            labels={"Porcentaje": "% de intentos"},
+            category_orders={"Nivel": PERFORMANCE_ORDER},
+        )
+        fig_levels.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
+        fig_levels.update_yaxes(range=[0, 100])
+        fig_levels.update_layout(showlegend=False, margin=dict(t=20, b=20))
+        st.plotly_chart(fig_levels, use_container_width=True)
+    st.caption("Progreso limitado: ≤25 · Emergente: >25–50 · Aceleración: >50–75 · Avanzado: >75.")
 
     st.markdown("### Desempeño por dimensión")
+    st.caption("La dimensión se calcula sobre los registros disponibles de sus ítems. El puntaje global de la prueba sí penaliza los ítems faltantes mediante el total esperado.")
     dim_df = test_df[test_df["Descriptor"].astype(str).str.strip().ne("")].copy()
     if dim_df.empty:
         st.info("No hay dimensiones registradas para esta combinación de prueba y grado.")
@@ -522,7 +656,10 @@ with detail_tab:
             course_test_display = course_test_summary.copy()
             course_test_display["Promedio"] = course_test_display["Promedio"].round(1).astype(str) + "%"
             course_test_display["DE"] = course_test_display["DE"].round(1)
-            st.dataframe(course_test_display[["Curso", "Promedio", "DE", "Estudiantes", "Intentos"]], use_container_width=True, hide_index=True)
+            course_test_display["Ítems esperados"] = course_test_display["Items_esperados"].astype(int)
+            course_test_display["Faltantes prom."] = course_test_display["Faltantes_prom"].round(1)
+            course_test_display["Cobertura"] = course_test_display["Cobertura_prom"].round(1).astype(str) + "%"
+            st.dataframe(course_test_display[["Curso", "Promedio", "DE", "Estudiantes", "Ítems esperados", "Faltantes prom.", "Cobertura"]], use_container_width=True, hide_index=True)
 
 st.sidebar.markdown("---")
-st.sidebar.caption("El tablero se centra únicamente en grado, prueba, dimensiones y desagregación por curso.")
+st.sidebar.caption("El tablero integra grado, prueba, dimensiones, curso, cobertura de respuesta, faltantes y niveles de desempeño.")
