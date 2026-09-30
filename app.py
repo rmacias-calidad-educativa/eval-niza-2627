@@ -9,172 +9,452 @@ import streamlit as st
 
 st.set_page_config(page_title="Resultados académicos", page_icon="📊", layout="wide", initial_sidebar_state="expanded")
 
-GRADE_MAP = {3:"TERCERO",4:"CUARTO",5:"QUINTO",6:"SEXTO",7:"SEPTIMO",8:"OCTAVO",9:"NOVENO",10:"DECIMO",11:"UNDECIMO"}
-GRADE_ORDER = list(GRADE_MAP.values())
+GRADE_NUM_TO_NAME = {
+    3: "TERCERO",
+    4: "CUARTO",
+    5: "QUINTO",
+    6: "SEXTO",
+    7: "SEPTIMO",
+    8: "OCTAVO",
+    9: "NOVENO",
+    10: "DECIMO",
+    11: "UNDECIMO",
+}
+GRADE_NAME_TO_NUM = {v: k for k, v in GRADE_NUM_TO_NAME.items()}
+GRADE_ORDER_NUM = [3, 4, 5, 6, 7, 8, 9, 10, 11]
+GRADE_LABEL = {g: f"{g}°" for g in GRADE_ORDER_NUM}
+TEST_ORDER = ["Matemáticas", "Lectura", "Ciencias naturales", "Ciencias sociales", "Inglés"]
 DEFAULT_FILE = Path(__file__).parent / "data" / "base_resultados.xlsx"
 
-st.markdown("""
+st.markdown(
+    """
 <style>
-.block-container {padding-top: 1.7rem; padding-bottom: 2rem;}
-div[data-testid="stMetric"] {background: rgba(127,127,127,.06); border: 1px solid rgba(127,127,127,.16); padding: 14px 16px; border-radius: 14px;}
-div[data-testid="stMetricValue"] {font-size: 1.75rem;}
+.block-container {padding-top: 1.5rem; padding-bottom: 2rem;}
+div[data-testid="stMetric"] {
+    background: rgba(127,127,127,.06);
+    border: 1px solid rgba(127,127,127,.16);
+    padding: 14px 16px;
+    border-radius: 14px;
+}
+div[data-testid="stMetricValue"] {font-size: 1.65rem;}
+.small-note {font-size: .92rem; color: #5c5c5c;}
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
+
+
+def pct(x, digits=1):
+    return "–" if pd.isna(x) else f"{x:.{digits}f}%"
+
+
+def numfmt(x, digits=1):
+    return "–" if pd.isna(x) else f"{x:.{digits}f}"
+
+
+def clean_text(x):
+    if pd.isna(x):
+        return ""
+    x = str(x)
+    x = html.unescape(html.unescape(x)).replace("\\xa0", " ")
+    return x.strip()
+
+
+def infer_grade_num_from_quiz(quiz_name: str):
+    m = re.search(r"(\d{1,2})\s*°", str(quiz_name))
+    return int(m.group(1)) if m else None
+
+
+def infer_grade_num_from_grade(raw_grade: str):
+    raw = clean_text(raw_grade).upper()
+    return GRADE_NAME_TO_NUM.get(raw)
+
+
+def normalize_test(quiz_name: str):
+    q = clean_text(quiz_name).upper()
+    if "MATEM" in q:
+        return "Matemáticas"
+    if "LENGUAJE" in q:
+        return "Lectura"
+    if "LECTURA CR" in q:
+        return "Lectura"
+    if "CIENCIAS" in q:
+        return "Ciencias naturales"
+    if "COMPETENCIAS CIUDADANAS" in q or "SOCIALES Y CIUDADANAS" in q:
+        return "Ciencias sociales"
+    if "INGL" in q:
+        return "Inglés"
+    return "Otra"
+
+
+def normalize_subtest(quiz_name: str):
+    q = clean_text(quiz_name).upper()
+    grade_num = infer_grade_num_from_quiz(q)
+    if "MATEM" in q:
+        return "Matemáticas"
+    if "LENGUAJE" in q:
+        return "Competencias Comunicativas en Lenguaje: Lectura" if (grade_num is None or grade_num <= 9) else "Lectura crítica"
+    if "LECTURA CR" in q:
+        return "Lectura crítica"
+    if "CIENCIAS" in q:
+        return "Ciencias Naturales y Educación Ambiental" if (grade_num is not None and grade_num <= 9) else "Ciencias Naturales"
+    if "COMPETENCIAS CIUDADANAS" in q:
+        return "Competencias Ciudadanas: Pensamiento Ciudadano"
+    if "SOCIALES Y CIUDADANAS" in q:
+        return "Sociales y ciudadanas"
+    if "INGL" in q:
+        return "Inglés"
+    return clean_text(quiz_name)
+
+
+def is_applicable(grade_num: int, test_name: str):
+    if grade_num is None:
+        return False
+    rules = {
+        "Matemáticas": lambda g: 3 <= g <= 11,
+        "Lectura": lambda g: 3 <= g <= 11,
+        "Ciencias naturales": lambda g: 5 <= g <= 11,
+        "Ciencias sociales": lambda g: 5 <= g <= 11,
+        "Inglés": lambda g: 9 <= g <= 11,
+    }
+    return rules.get(test_name, lambda g: False)(grade_num)
+
 
 @st.cache_data(show_spinner=False)
 def load_data(source):
     df = pd.read_excel(source)
-    for c in ["Sede","Grado","AULA","Nombre","Apellido","QuizName","Pregunta","RespuestaEst","Descriptor"]:
+    for c in ["Sede", "Grado", "AULA", "Nombre", "Apellido", "QuizName", "Pregunta", "RespuestaEst", "Descriptor"]:
         if c in df.columns:
-            df[c] = df[c].fillna("").astype(str).map(lambda x: html.unescape(html.unescape(x)).replace("\\xa0", " ").strip())
-    df["IsCorrect"] = pd.to_numeric(df["IsCorrect"], errors="coerce")
+            df[c] = df[c].map(clean_text)
+
+    if "IsCorrect" in df.columns:
+        df["IsCorrect"] = pd.to_numeric(df["IsCorrect"], errors="coerce")
     df["AttemptId"] = df["AttemptId"].astype(str)
     if "IdentiEstudiante" in df.columns:
-        df["IdentiEstudiante"] = df["IdentiEstudiante"].astype(str)
+        df["IdentiEstudiante"] = df["IdentiEstudiante"].astype(str).map(clean_text)
 
-    dedup_cols = [c for c in ["AttemptId","QuizName","Pregunta","RespuestaEst","IsCorrect","Descriptor"] if c in df.columns]
+    dedup_cols = [c for c in ["AttemptId", "QuizName", "Pregunta", "RespuestaEst", "IsCorrect", "Descriptor"] if c in df.columns]
     df = df.drop_duplicates(dedup_cols, keep="first").copy()
 
-    def infer_grade(q):
-        m = re.search(r"(\\d{1,2})\\s*°", str(q))
-        return GRADE_MAP.get(int(m.group(1))) if m else None
-    df["Grado_prueba"] = df["QuizName"].map(infer_grade)
-    df["Grado_analisis"] = df["Grado_prueba"].fillna(df["Grado"])
+    df["Grado_num"] = df["QuizName"].map(infer_grade_num_from_quiz)
+    missing_grade = df["Grado_num"].isna()
+    df.loc[missing_grade, "Grado_num"] = df.loc[missing_grade, "Grado"].map(infer_grade_num_from_grade)
+    df["Grado_num"] = pd.to_numeric(df["Grado_num"], errors="coerce")
+    df["Grado_analisis"] = df["Grado_num"].map(lambda x: GRADE_LABEL.get(int(x)) if pd.notna(x) else None)
+
+    df["Prueba_grupo"] = df["QuizName"].map(normalize_test)
+    df["Subprueba"] = df["QuizName"].map(normalize_subtest)
+    df["Curso"] = df["AULA"].replace("", np.nan)
+    df = df[df["Prueba_grupo"].isin(TEST_ORDER)].copy()
     return df
+
 
 @st.cache_data(show_spinner=False)
 def attempt_table(df):
+    cols = [c for c in ["AttemptId", "Prueba_grupo", "Subprueba", "QuizName", "Grado_num", "Grado_analisis", "Curso"] if c in df.columns]
     if df.empty:
-        return pd.DataFrame(columns=["AttemptId","QuizName","Grado_analisis","Puntaje","Respuestas","Estudiante","Sede"])
-    agg = df.groupby(["AttemptId","QuizName","Grado_analisis"], dropna=False).agg(
-        Puntaje=("IsCorrect","mean"),
-        Respuestas=("IsCorrect","count"),
-        Estudiante=("IdentiEstudiante","first"),
-        Sede=("Sede","first")
-    ).reset_index()
-    agg["Puntaje"] *= 100
+        return pd.DataFrame(columns=cols + ["Puntaje", "Respuestas", "Estudiante", "Sede"])
+
+    agg = (
+        df.groupby(cols, dropna=False)
+        .agg(
+            Puntaje=("IsCorrect", "mean"),
+            Respuestas=("IsCorrect", "count"),
+            Estudiante=("IdentiEstudiante", "first"),
+            Sede=("Sede", "first"),
+        )
+        .reset_index()
+    )
+    agg["Puntaje"] = agg["Puntaje"] * 100
     return agg
 
-def pct(x):
-    return "–" if pd.isna(x) else f"{x:.1f}%"
 
-def ordered_grades(values):
-    vals = list(pd.Series(values).dropna().astype(str).unique())
-    return [g for g in GRADE_ORDER if g in vals] + sorted([g for g in vals if g not in GRADE_ORDER])
+def stats_table(att_df, group_cols):
+    if att_df.empty:
+        return pd.DataFrame(columns=group_cols + ["Promedio", "DE", "Estudiantes", "Intentos"])
+    out = (
+        att_df.groupby(group_cols, dropna=False)
+        .agg(
+            Promedio=("Puntaje", "mean"),
+            DE=("Puntaje", "std"),
+            Estudiantes=("Estudiante", pd.Series.nunique),
+            Intentos=("AttemptId", pd.Series.nunique),
+        )
+        .reset_index()
+    )
+    out["DE"] = out["DE"].fillna(0)
+    return out
+
+
+def build_grade_summary_matrix(summary_df):
+    rows = []
+    for grade_num in GRADE_ORDER_NUM:
+        row = {"Grado": GRADE_LABEL[grade_num]}
+        for test_name in TEST_ORDER:
+            mask = (summary_df["Grado_num"] == grade_num) & (summary_df["Prueba_grupo"] == test_name)
+            tmp = summary_df.loc[mask]
+            if not is_applicable(grade_num, test_name):
+                row[test_name] = "No aplica"
+            elif tmp.empty:
+                row[test_name] = "Sin datos"
+            else:
+                r = tmp.iloc[0]
+                row[test_name] = f"Prom {r['Promedio']:.1f}% | DE {r['DE']:.1f} | n {int(r['Estudiantes'])}"
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def ordered_grade_labels(values):
+    found = [v for v in pd.Series(values).dropna().unique().tolist() if v in GRADE_LABEL.values()]
+    return [GRADE_LABEL[g] for g in GRADE_ORDER_NUM if GRADE_LABEL[g] in found]
+
 
 uploaded = st.sidebar.file_uploader("Usar otro archivo XLSX", type=["xlsx"])
 source = uploaded if uploaded is not None else DEFAULT_FILE
+
 df = load_data(source)
+att = attempt_table(df)
 
 st.title("📊 Visualizador de resultados académicos")
-st.caption("Panorama por grado y prueba, con detalle de dimensiones por prueba.")
+st.caption("Resumen por grado y prueba, con un detalle centrado únicamente en pruebas y dimensiones.")
 
 st.sidebar.header("Filtros")
 sedes = sorted([x for x in df["Sede"].dropna().astype(str).unique() if x]) if "Sede" in df.columns else []
 sede_sel = st.sidebar.multiselect("Sede", sedes)
 base = df[df["Sede"].isin(sede_sel)].copy() if sede_sel else df.copy()
+att_base = attempt_table(base)
 
-tab_general, tab_prueba = st.tabs(["🌐 Vista general", "🎯 Detalle por prueba"])
+main_tab, detail_tab = st.tabs(["🌐 Vista general", "🎯 Pruebas y dimensiones"])
 
-with tab_general:
-    st.subheader("Vista general por grado y prueba")
-    st.write("Una lectura ejecutiva de cobertura y desempeño: **grado → prueba**.")
-    att = attempt_table(base)
+with main_tab:
+    st.subheader("Vista general por grado")
+    st.write("Para cada grado se muestran las **5 pruebas agrupadas**: Matemáticas, Lectura, Ciencias naturales, Ciencias sociales e Inglés. Cuando una prueba no corresponde al grado, aparece como **No aplica**.")
 
-    c1,c2,c3,c4 = st.columns(4)
-    c1.metric("Estudiantes", f"{base['IdentiEstudiante'].nunique():,}".replace(",","."))
-    c2.metric("Intentos", f"{att['AttemptId'].nunique():,}".replace(",","."))
-    c3.metric("Pruebas", f"{base['QuizName'].nunique():,}".replace(",","."))
-    c4.metric("Puntaje promedio", pct(att["Puntaje"].mean()))
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Estudiantes", f"{base['IdentiEstudiante'].nunique():,}".replace(",", "."))
+    c2.metric("Intentos", f"{att_base['AttemptId'].nunique():,}".replace(",", "."))
+    c3.metric("Grados con datos", f"{att_base['Grado_analisis'].nunique():,}".replace(",", "."))
+    c4.metric("Promedio general", pct(att_base["Puntaje"].mean()))
 
-    st.markdown("### Resultados por grado")
-    grade = att.groupby("Grado_analisis", as_index=False).agg(
-        Puntaje=("Puntaje","mean"), Estudiantes=("Estudiante","nunique"), Intentos=("AttemptId","nunique"), Pruebas=("QuizName","nunique")
+    grade_test_summary = stats_table(att_base, ["Grado_num", "Grado_analisis", "Prueba_grupo"])
+    matrix_df = build_grade_summary_matrix(grade_test_summary)
+
+    st.markdown("### Resumen general: grado × prueba")
+    st.dataframe(matrix_df, use_container_width=True, hide_index=True)
+    st.markdown("<div class='small-note'>Cada celda muestra: promedio, desviación estándar (DE) y cantidad de estudiantes únicos.</div>", unsafe_allow_html=True)
+
+    st.markdown("### Resultado promedio por grado y prueba")
+    chart_df = grade_test_summary.copy()
+    chart_df["Grado"] = chart_df["Grado_num"].map(GRADE_LABEL)
+    fig = px.bar(
+        chart_df,
+        x="Grado",
+        y="Promedio",
+        color="Prueba_grupo",
+        barmode="group",
+        text="Promedio",
+        labels={"Promedio": "Puntaje promedio (%)", "Prueba_grupo": "Prueba"},
+        category_orders={"Grado": [GRADE_LABEL[g] for g in GRADE_ORDER_NUM], "Prueba_grupo": TEST_ORDER},
     )
-    order = ordered_grades(grade["Grado_analisis"])
-    left,right = st.columns([1.35,1])
-    with left:
-        fig = px.bar(grade, x="Grado_analisis", y="Puntaje", text="Puntaje",
-                     category_orders={"Grado_analisis":order},
-                     labels={"Grado_analisis":"Grado","Puntaje":"Puntaje promedio (%)"})
-        fig.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
-        fig.update_yaxes(range=[0,100]); fig.update_layout(showlegend=False, margin=dict(t=20,b=20))
-        st.plotly_chart(fig, use_container_width=True)
-    with right:
-        t = grade.copy().rename(columns={"Grado_analisis":"Grado"})
-        t["Puntaje promedio"] = t["Puntaje"].round(1).astype(str) + "%"
-        t["_orden"] = t["Grado"].map({g:i for i,g in enumerate(order)})
-        st.dataframe(t.sort_values("_orden").drop(columns=["_orden","Puntaje"]), use_container_width=True, hide_index=True)
-
-    st.markdown("### Mapa de desempeño: grado × prueba")
-    mx = att.groupby(["Grado_analisis","QuizName"], as_index=False)["Puntaje"].mean()
-    piv = mx.pivot(index="QuizName", columns="Grado_analisis", values="Puntaje")
-    cols = [g for g in order if g in piv.columns]
-    if cols: piv = piv[cols]
-    if not piv.empty:
-        fig = px.imshow(piv, text_auto=".0f", aspect="auto", zmin=0, zmax=100,
-                        labels={"x":"Grado","y":"Prueba","color":"Puntaje %"})
-        fig.update_layout(height=max(430, 33*len(piv)), margin=dict(t=15,b=20))
-        st.plotly_chart(fig, use_container_width=True)
-
-    st.markdown("### Resultados por prueba")
-    quiz = att.groupby(["QuizName","Grado_analisis"], as_index=False).agg(
-        Puntaje=("Puntaje","mean"), Estudiantes=("Estudiante","nunique"), Intentos=("AttemptId","nunique")
-    )
-    fig = px.bar(quiz.sort_values("Puntaje"), y="QuizName", x="Puntaje", color="Grado_analisis", orientation="h", text="Puntaje",
-                 labels={"QuizName":"Prueba","Puntaje":"Puntaje promedio (%)","Grado_analisis":"Grado"},
-                 category_orders={"Grado_analisis":order})
-    fig.update_traces(texttemplate="%{text:.0f}%", textposition="outside")
-    fig.update_xaxes(range=[0,100]); fig.update_layout(height=max(500,30*len(quiz)), margin=dict(t=20,b=20))
+    fig.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
+    fig.update_yaxes(range=[0, 100])
+    fig.update_layout(margin=dict(t=20, b=20))
     st.plotly_chart(fig, use_container_width=True)
 
-    qt = quiz.rename(columns={"QuizName":"Prueba","Grado_analisis":"Grado"}).copy()
-    qt["Puntaje promedio"] = qt["Puntaje"].round(1).astype(str) + "%"
-    st.dataframe(qt.drop(columns="Puntaje"), use_container_width=True, hide_index=True)
+    st.markdown("### Desagregación por curso dentro del grado")
+    grade_options = [GRADE_LABEL[g] for g in GRADE_ORDER_NUM]
+    selected_grade_label = st.selectbox("Selecciona un grado", grade_options, index=0)
+    selected_grade_num = int(selected_grade_label.replace("°", ""))
 
-with tab_prueba:
-    st.subheader("Detalle de una prueba y sus dimensiones")
-    st.write("Selecciona una prueba y revisa su resultado general junto con el comportamiento de cada dimensión.")
-    quizzes = sorted([x for x in base["QuizName"].dropna().astype(str).unique() if x])
-    if not quizzes:
-        st.info("No hay pruebas disponibles con los filtros actuales.")
-    else:
-        selected = st.selectbox("Prueba", quizzes)
-        qdf = base[base["QuizName"] == selected].copy()
-        qatt = attempt_table(qdf)
-        grades_q = ordered_grades(qdf["Grado_analisis"])
-
-        c1,c2,c3,c4 = st.columns(4)
-        c1.metric("Grado", ", ".join(grades_q) if grades_q else "–")
-        c2.metric("Estudiantes", f"{qdf['IdentiEstudiante'].nunique():,}".replace(",","."))
-        c3.metric("Intentos", f"{qatt['AttemptId'].nunique():,}".replace(",","."))
-        c4.metric("Puntaje promedio", pct(qatt["Puntaje"].mean()))
-
-        dim = qdf[qdf["Descriptor"].astype(str).str.strip().ne("")].groupby("Descriptor", as_index=False).agg(
-            Acierto=("IsCorrect","mean"), Respuestas=("IsCorrect","count"), Estudiantes=("IdentiEstudiante","nunique")
-        )
-        dim["Acierto"] *= 100
-
-        st.markdown("### Desempeño por dimensión")
-        if dim.empty:
-            st.info("Esta prueba no tiene dimensiones registradas en la base.")
+    grade_summary = grade_test_summary[grade_test_summary["Grado_num"] == selected_grade_num].copy()
+    grade_rows = []
+    for test_name in TEST_ORDER:
+        row = {"Prueba": test_name}
+        tmp = grade_summary[grade_summary["Prueba_grupo"] == test_name]
+        if not is_applicable(selected_grade_num, test_name):
+            row.update({"Aplicación": "No aplica", "Promedio": "–", "DE": "–", "Estudiantes": "–", "Intentos": "–"})
+        elif tmp.empty:
+            row.update({"Aplicación": "Sin datos", "Promedio": "–", "DE": "–", "Estudiantes": "–", "Intentos": "–"})
         else:
-            ds = dim.sort_values("Acierto")
-            fig = px.bar(ds, y="Descriptor", x="Acierto", orientation="h", text="Acierto",
-                         labels={"Descriptor":"Dimensión","Acierto":"Acierto (%)"})
-            fig.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
-            fig.update_xaxes(range=[0,100]); fig.update_layout(height=max(420,48*len(ds)), margin=dict(t=15,b=20))
-            st.plotly_chart(fig, use_container_width=True)
+            r = tmp.iloc[0]
+            row.update({
+                "Aplicación": "Aplicada",
+                "Promedio": f"{r['Promedio']:.1f}%",
+                "DE": f"{r['DE']:.1f}",
+                "Estudiantes": int(r["Estudiantes"]),
+                "Intentos": int(r["Intentos"]),
+            })
+        grade_rows.append(row)
+    st.dataframe(pd.DataFrame(grade_rows), use_container_width=True, hide_index=True)
 
-            td = dim.sort_values("Acierto", ascending=False).copy()
-            td["% de acierto"] = td["Acierto"].round(1).astype(str) + "%"
-            st.dataframe(td.rename(columns={"Descriptor":"Dimensión"}).drop(columns="Acierto"), use_container_width=True, hide_index=True)
+    grade_att = att_base[att_base["Grado_num"] == selected_grade_num].copy()
+    available_courses = sorted([x for x in grade_att["Curso"].dropna().astype(str).unique() if x])
+    course_sel = st.multiselect("Curso(s)", available_courses, default=[])
+    if course_sel:
+        grade_att = grade_att[grade_att["Curso"].isin(course_sel)].copy()
 
-            best = dim.loc[dim["Acierto"].idxmax()]
-            low = dim.loc[dim["Acierto"].idxmin()]
-            b1,b2 = st.columns(2)
-            b1.success(f"Mayor desempeño: **{best['Descriptor']}** · {best['Acierto']:.1f}%")
-            b2.warning(f"Menor desempeño: **{low['Descriptor']}** · {low['Acierto']:.1f}%")
+    course_summary = stats_table(grade_att, ["Curso", "Prueba_grupo"]) if not grade_att.empty else pd.DataFrame()
+    if course_summary.empty:
+        st.info("No hay datos de cursos para el grado seleccionado con los filtros actuales.")
+    else:
+        course_summary["Promedio_fmt"] = course_summary["Promedio"].map(lambda x: f"{x:.1f}%")
+        course_summary["DE_fmt"] = course_summary["DE"].map(lambda x: f"{x:.1f}")
+        fig_course = px.bar(
+            course_summary,
+            x="Curso",
+            y="Promedio",
+            color="Prueba_grupo",
+            barmode="group",
+            text="Promedio",
+            labels={"Promedio": "Puntaje promedio (%)", "Prueba_grupo": "Prueba"},
+            category_orders={"Prueba_grupo": TEST_ORDER},
+        )
+        fig_course.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
+        fig_course.update_yaxes(range=[0, 100])
+        fig_course.update_layout(margin=dict(t=20, b=20))
+        st.plotly_chart(fig_course, use_container_width=True)
+
+        display_course = course_summary.rename(columns={"Prueba_grupo": "Prueba"}).copy()
+        display_course["Promedio"] = display_course["Promedio"].round(1).astype(str) + "%"
+        display_course["DE"] = display_course["DE"].round(1)
+        st.dataframe(display_course[["Curso", "Prueba", "Promedio", "DE", "Estudiantes", "Intentos"]], use_container_width=True, hide_index=True)
+
+with detail_tab:
+    st.subheader("Detalle por prueba y dimensiones")
+    st.write("Las pruebas se agrupan sin el número final del grado. Luego puedes ver cómo cambian sus resultados por grado y, dentro de un grado, por dimensión y curso.")
+
+    selected_test = st.selectbox("Prueba agrupada", TEST_ORDER)
+    applicable_grades = [g for g in GRADE_ORDER_NUM if is_applicable(g, selected_test)]
+    test_att = att_base[att_base["Prueba_grupo"] == selected_test].copy()
+
+    test_summary = stats_table(test_att, ["Grado_num", "Grado_analisis", "Subprueba"]) if not test_att.empty else pd.DataFrame()
+
+    rows = []
+    for g in applicable_grades:
+        tmp = test_summary[test_summary["Grado_num"] == g] if not test_summary.empty else pd.DataFrame()
+        if tmp.empty:
+            rows.append({
+                "Grado": GRADE_LABEL[g],
+                "Subprueba": "Sin datos",
+                "Promedio": np.nan,
+                "DE": np.nan,
+                "Estudiantes": np.nan,
+                "Intentos": np.nan,
+                "Estado": "Sin datos",
+            })
+        else:
+            for _, r in tmp.iterrows():
+                rows.append({
+                    "Grado": GRADE_LABEL[g],
+                    "Subprueba": r["Subprueba"],
+                    "Promedio": r["Promedio"],
+                    "DE": r["DE"],
+                    "Estudiantes": int(r["Estudiantes"]),
+                    "Intentos": int(r["Intentos"]),
+                    "Estado": "Aplicada",
+                })
+    test_grade_df = pd.DataFrame(rows)
+
+    st.markdown("### Resultado de la prueba por grado")
+    if test_grade_df.empty or test_grade_df["Promedio"].dropna().empty:
+        st.info("No hay datos disponibles para esta prueba con los filtros actuales.")
+    else:
+        fig_test = px.bar(
+            test_grade_df.dropna(subset=["Promedio"]),
+            x="Grado",
+            y="Promedio",
+            color="Subprueba",
+            barmode="group",
+            text="Promedio",
+            labels={"Promedio": "Puntaje promedio (%)", "Subprueba": "Tipo de prueba"},
+            category_orders={"Grado": [GRADE_LABEL[g] for g in applicable_grades]},
+        )
+        fig_test.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
+        fig_test.update_yaxes(range=[0, 100])
+        fig_test.update_layout(margin=dict(t=20, b=20))
+        st.plotly_chart(fig_test, use_container_width=True)
+
+    display_test_grade = test_grade_df.copy()
+    display_test_grade["Promedio"] = display_test_grade["Promedio"].map(lambda x: "–" if pd.isna(x) else f"{x:.1f}%")
+    display_test_grade["DE"] = display_test_grade["DE"].map(lambda x: "–" if pd.isna(x) else f"{x:.1f}")
+    st.dataframe(display_test_grade[["Grado", "Subprueba", "Estado", "Promedio", "DE", "Estudiantes", "Intentos"]], use_container_width=True, hide_index=True)
+
+    selected_grade_for_test = st.selectbox("Grado para ver dimensiones", [GRADE_LABEL[g] for g in applicable_grades], index=0)
+    selected_grade_num_for_test = int(selected_grade_for_test.replace("°", ""))
+
+    test_df = base[(base["Prueba_grupo"] == selected_test) & (base["Grado_num"] == selected_grade_num_for_test)].copy()
+    att_test_grade = test_att[test_att["Grado_num"] == selected_grade_num_for_test].copy()
+
+    grade_courses = sorted([x for x in att_test_grade["Curso"].dropna().astype(str).unique() if x])
+    selected_courses_test = st.multiselect("Curso(s) dentro del grado seleccionado", grade_courses, default=[])
+    if selected_courses_test:
+        att_test_grade = att_test_grade[att_test_grade["Curso"].isin(selected_courses_test)].copy()
+        test_df = test_df[test_df["Curso"].isin(selected_courses_test)].copy()
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Grado", selected_grade_for_test)
+    c2.metric("Estudiantes", f"{att_test_grade['Estudiante'].nunique():,}".replace(",", "."))
+    c3.metric("Intentos", f"{att_test_grade['AttemptId'].nunique():,}".replace(",", "."))
+    c4.metric("Promedio", pct(att_test_grade["Puntaje"].mean()))
+
+    st.markdown("### Desempeño por dimensión")
+    dim_df = test_df[test_df["Descriptor"].astype(str).str.strip().ne("")].copy()
+    if dim_df.empty:
+        st.info("No hay dimensiones registradas para esta combinación de prueba y grado.")
+    else:
+        dim_summary = (
+            dim_df.groupby("Descriptor", dropna=False)
+            .agg(
+                Acierto=("IsCorrect", "mean"),
+                Respuestas=("IsCorrect", "count"),
+                Estudiantes=("IdentiEstudiante", pd.Series.nunique),
+            )
+            .reset_index()
+        )
+        dim_summary["Acierto"] = dim_summary["Acierto"] * 100
+        dim_summary = dim_summary.sort_values("Acierto", ascending=False)
+
+        fig_dim = px.bar(
+            dim_summary.sort_values("Acierto"),
+            y="Descriptor",
+            x="Acierto",
+            orientation="h",
+            text="Acierto",
+            labels={"Descriptor": "Dimensión", "Acierto": "Acierto (%)"},
+        )
+        fig_dim.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
+        fig_dim.update_xaxes(range=[0, 100])
+        fig_dim.update_layout(height=max(360, 45 * len(dim_summary)), margin=dict(t=20, b=20))
+        st.plotly_chart(fig_dim, use_container_width=True)
+
+        dim_display = dim_summary.rename(columns={"Descriptor": "Dimensión"}).copy()
+        dim_display["Acierto"] = dim_display["Acierto"].round(1).astype(str) + "%"
+        st.dataframe(dim_display, use_container_width=True, hide_index=True)
+
+    st.markdown("### Desagregación por curso en esta prueba")
+    if att_test_grade.empty:
+        st.info("No hay datos por curso para esta combinación.")
+    else:
+        course_test_summary = stats_table(att_test_grade, ["Curso"]) if not att_test_grade.empty else pd.DataFrame()
+        if course_test_summary.empty:
+            st.info("No hay datos por curso para esta combinación.")
+        else:
+            fig_ct = px.bar(
+                course_test_summary,
+                x="Curso",
+                y="Promedio",
+                text="Promedio",
+                labels={"Promedio": "Puntaje promedio (%)"},
+            )
+            fig_ct.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
+            fig_ct.update_yaxes(range=[0, 100])
+            fig_ct.update_layout(margin=dict(t=20, b=20))
+            st.plotly_chart(fig_ct, use_container_width=True)
+
+            course_test_display = course_test_summary.copy()
+            course_test_display["Promedio"] = course_test_display["Promedio"].round(1).astype(str) + "%"
+            course_test_display["DE"] = course_test_display["DE"].round(1)
+            st.dataframe(course_test_display[["Curso", "Promedio", "DE", "Estudiantes", "Intentos"]], use_container_width=True, hide_index=True)
 
 st.sidebar.markdown("---")
-st.sidebar.caption("El tablero se concentra exclusivamente en grado, prueba y dimensiones.")
+st.sidebar.caption("El tablero se centra únicamente en grado, prueba, dimensiones y desagregación por curso.")
