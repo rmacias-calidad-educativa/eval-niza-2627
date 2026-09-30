@@ -216,6 +216,50 @@ def ordered_grade_labels(values):
     return [GRADE_LABEL[g] for g in GRADE_ORDER_NUM if GRADE_LABEL[g] in found]
 
 
+def build_grade_course_matrix(att_df):
+    """Tabla consolidada: una fila por grado/curso y una columna por prueba."""
+    if att_df.empty:
+        return pd.DataFrame(columns=["Grado", "Curso"] + TEST_ORDER)
+
+    valid = att_df.dropna(subset=["Grado_num", "Curso"]).copy()
+    if valid.empty:
+        return pd.DataFrame(columns=["Grado", "Curso"] + TEST_ORDER)
+
+    summary = stats_table(valid, ["Grado_num", "Curso", "Prueba_grupo"])
+    pairs = (
+        valid[["Grado_num", "Curso"]]
+        .drop_duplicates()
+        .sort_values(["Grado_num", "Curso"])
+    )
+
+    rows = []
+    for _, pair in pairs.iterrows():
+        grade_num = int(pair["Grado_num"])
+        course = pair["Curso"]
+        row = {"Grado": GRADE_LABEL.get(grade_num, str(grade_num)), "Curso": course}
+
+        for test_name in TEST_ORDER:
+            if not is_applicable(grade_num, test_name):
+                row[test_name] = "No aplica"
+                continue
+
+            tmp = summary[
+                (summary["Grado_num"] == grade_num)
+                & (summary["Curso"] == course)
+                & (summary["Prueba_grupo"] == test_name)
+            ]
+            if tmp.empty:
+                row[test_name] = "Sin datos"
+            else:
+                r = tmp.iloc[0]
+                row[test_name] = (
+                    f"Prom {r['Promedio']:.1f}% | DE {r['DE']:.1f} | n {int(r['Estudiantes'])}"
+                )
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
 uploaded = st.sidebar.file_uploader("Usar otro archivo XLSX", type=["xlsx"])
 source = uploaded if uploaded is not None else DEFAULT_FILE
 
@@ -325,6 +369,23 @@ with main_tab:
         display_course["Promedio"] = display_course["Promedio"].round(1).astype(str) + "%"
         display_course["DE"] = display_course["DE"].round(1)
         st.dataframe(display_course[["Curso", "Prueba", "Promedio", "DE", "Estudiantes", "Intentos"]], use_container_width=True, hide_index=True)
+
+    st.markdown("### Tabla consolidada final: grado × curso × prueba")
+    st.write(
+        "Esta tabla resume todos los cursos en una sola vista. Cada celda contiene "
+        "**promedio, DE y número de estudiantes**; cuando una prueba no corresponde al grado, se muestra **No aplica**."
+    )
+    final_course_matrix = build_grade_course_matrix(att_base)
+    if final_course_matrix.empty:
+        st.info("No hay información de cursos disponible con los filtros actuales.")
+    else:
+        st.dataframe(final_course_matrix, use_container_width=True, hide_index=True)
+        st.download_button(
+            "Descargar tabla consolidada en CSV",
+            data=final_course_matrix.to_csv(index=False).encode("utf-8-sig"),
+            file_name="resultados_por_grado_curso_prueba.csv",
+            mime="text/csv",
+        )
 
 with detail_tab:
     st.subheader("Detalle por prueba y dimensiones")
