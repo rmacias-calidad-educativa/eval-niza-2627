@@ -397,6 +397,33 @@ with main_tab:
     fig.update_layout(margin=dict(t=20, b=20))
     st.plotly_chart(fig, use_container_width=True)
 
+    st.markdown("### Progresión observada del desempeño por área entre grados")
+    st.write(
+        "Este gráfico permite seguir visualmente cómo cambia el **promedio de cada área** a medida que aumenta el grado. "
+        "La lectura es transversal entre grados y no representa crecimiento longitudinal de los mismos estudiantes."
+    )
+    growth_df = grade_test_summary.copy()
+    growth_df = growth_df[growth_df["Prueba_grupo"].isin(TEST_ORDER)].copy()
+    growth_df["Grado"] = growth_df["Grado_num"].map(GRADE_LABEL)
+    growth_df = growth_df.sort_values(["Prueba_grupo", "Grado_num"])
+    if growth_df.empty:
+        st.info("No hay información suficiente para mostrar la progresión por área.")
+    else:
+        fig_growth = px.line(
+            growth_df,
+            x="Grado",
+            y="Promedio",
+            color="Prueba_grupo",
+            markers=True,
+            text="Promedio",
+            labels={"Promedio": "Puntaje promedio (%)", "Prueba_grupo": "Área"},
+            category_orders={"Grado": [GRADE_LABEL[g] for g in GRADE_ORDER_NUM], "Prueba_grupo": TEST_ORDER},
+        )
+        fig_growth.update_traces(texttemplate="%{text:.1f}%", textposition="top center")
+        fig_growth.update_yaxes(range=[0, 100])
+        fig_growth.update_layout(margin=dict(t=20, b=20), legend_title_text="Área")
+        st.plotly_chart(fig_growth, use_container_width=True)
+
     st.markdown("### Desagregación por curso dentro del grado")
     grade_options = [GRADE_LABEL[g] for g in GRADE_ORDER_NUM]
     selected_grade_label = st.selectbox("Selecciona un grado", grade_options, index=0)
@@ -598,40 +625,49 @@ with detail_tab:
         st.plotly_chart(fig_levels, use_container_width=True)
     st.caption("Progreso limitado: ≤25 · Emergente: >25–50 · Aceleración: >50–75 · Avanzado: >75.")
 
-    st.markdown("### Desempeño por dimensión")
-    st.caption("La dimensión se calcula sobre los registros disponibles de sus ítems. El puntaje global de la prueba sí penaliza los ítems faltantes mediante el total esperado.")
-    dim_df = test_df[test_df["Descriptor"].astype(str).str.strip().ne("")].copy()
-    if dim_df.empty:
-        st.info("No hay dimensiones registradas para esta combinación de prueba y grado.")
+    if selected_test == "Inglés":
+        st.markdown("### Porcentaje de acierto en Inglés")
+        st.write(
+            "En Inglés no se muestran categorías como **Pre-A1, A1 o A2**. "
+            "El análisis se concentra únicamente en el **porcentaje de acierto de la prueba** y en los **niveles de desempeño**."
+        )
+        english_accuracy = att_test_grade["Puntaje"].mean()
+        st.metric("Porcentaje de acierto", pct(english_accuracy))
     else:
-        dim_summary = (
-            dim_df.groupby("Descriptor", dropna=False)
-            .agg(
-                Acierto=("IsCorrect", "mean"),
-                Respuestas=("IsCorrect", "count"),
-                Estudiantes=("IdentiEstudiante", pd.Series.nunique),
+        st.markdown("### Desempeño por dimensión")
+        st.caption("La dimensión se calcula sobre los registros disponibles de sus ítems. El puntaje global de la prueba sí penaliza los ítems faltantes mediante el total esperado.")
+        dim_df = test_df[test_df["Descriptor"].astype(str).str.strip().ne("")].copy()
+        if dim_df.empty:
+            st.info("No hay dimensiones registradas para esta combinación de prueba y grado.")
+        else:
+            dim_summary = (
+                dim_df.groupby("Descriptor", dropna=False)
+                .agg(
+                    Acierto=("IsCorrect", "mean"),
+                    Respuestas=("IsCorrect", "count"),
+                    Estudiantes=("IdentiEstudiante", pd.Series.nunique),
+                )
+                .reset_index()
             )
-            .reset_index()
-        )
-        dim_summary["Acierto"] = dim_summary["Acierto"] * 100
-        dim_summary = dim_summary.sort_values("Acierto", ascending=False)
+            dim_summary["Acierto"] = dim_summary["Acierto"] * 100
+            dim_summary = dim_summary.sort_values("Acierto", ascending=False)
 
-        fig_dim = px.bar(
-            dim_summary.sort_values("Acierto"),
-            y="Descriptor",
-            x="Acierto",
-            orientation="h",
-            text="Acierto",
-            labels={"Descriptor": "Dimensión", "Acierto": "Acierto (%)"},
-        )
-        fig_dim.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
-        fig_dim.update_xaxes(range=[0, 100])
-        fig_dim.update_layout(height=max(360, 45 * len(dim_summary)), margin=dict(t=20, b=20))
-        st.plotly_chart(fig_dim, use_container_width=True)
+            fig_dim = px.bar(
+                dim_summary.sort_values("Acierto"),
+                y="Descriptor",
+                x="Acierto",
+                orientation="h",
+                text="Acierto",
+                labels={"Descriptor": "Dimensión", "Acierto": "Acierto (%)"},
+            )
+            fig_dim.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
+            fig_dim.update_xaxes(range=[0, 100])
+            fig_dim.update_layout(height=max(360, 45 * len(dim_summary)), margin=dict(t=20, b=20))
+            st.plotly_chart(fig_dim, use_container_width=True)
 
-        dim_display = dim_summary.rename(columns={"Descriptor": "Dimensión"}).copy()
-        dim_display["Acierto"] = dim_display["Acierto"].round(1).astype(str) + "%"
-        st.dataframe(dim_display, use_container_width=True, hide_index=True)
+            dim_display = dim_summary.rename(columns={"Descriptor": "Dimensión"}).copy()
+            dim_display["Acierto"] = dim_display["Acierto"].round(1).astype(str) + "%"
+            st.dataframe(dim_display, use_container_width=True, hide_index=True)
 
     st.markdown("### Desagregación por curso en esta prueba")
     if att_test_grade.empty:
